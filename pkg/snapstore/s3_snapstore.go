@@ -16,10 +16,13 @@ package snapstore
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path"
 	"sort"
@@ -47,17 +50,21 @@ const (
 	awsRegion                   = "AWS_REGION"
 	awsEndpoint                 = "AWS_ENDPOINT"
 	awsForcePathStyle           = "AWS_FORCE_PATH_STYLE"
+	awsInsecureSkipVerify       = "AWS_INSECURE_SKIP_VERIFY"
+	awsTrustedCaCert            = "AWS_TRUSTED_CA_CERT"
 	awsCredentialFile           = "AWS_APPLICATION_CREDENTIALS"
 	awsCredentialJSONFile       = "AWS_APPLICATION_CREDENTIALS_JSON"
 )
 
 type awsCredentials struct {
-	AccessKeyID      string  `json:"accessKeyID"`
-	Region           string  `json:"region"`
-	SecretAccessKey  string  `json:"secretAccessKey"`
-	BucketName       string  `json:"bucketName"`
-	Endpoint         *string `json:"endpoint,omitempty"`
-	S3ForcePathStyle *bool   `json:"s3ForcePathStyle,omitempty"`
+	AccessKeyID        string  `json:"accessKeyID"`
+	Region             string  `json:"region"`
+	SecretAccessKey    string  `json:"secretAccessKey"`
+	BucketName         string  `json:"bucketName"`
+	Endpoint           *string `json:"endpoint,omitempty"`
+	S3ForcePathStyle   *bool   `json:"s3ForcePathStyle,omitempty"`
+	InsecureSkipVerify *bool   `json:"insecureSkipVerify,omitempty"`
+	TrustedCaCert      *string `json:"trustedCaCert,omitempty"`
 }
 
 // S3SnapStore is snapstore with AWS S3 object store as backend
@@ -96,6 +103,28 @@ func getSessionOptions(prefixString string) (session.Options, error) {
 	if val, err := strconv.ParseBool(os.Getenv(awsForcePathStyle)); err == nil {
 		s3path = &val
 	}
+
+	httpClient := http.DefaultClient
+	if insecureSkipVerify, err := strconv.ParseBool(os.Getenv(awsInsecureSkipVerify)); err == nil {
+		if insecureSkipVerify {
+			httpClient.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+			}
+		}
+	}
+
+	if trustedCaCert := os.Getenv(awsTrustedCaCert); trustedCaCert != "" {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM([]byte(trustedCaCert))
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:            caCertPool,
+				InsecureSkipVerify: false,
+				MinVersion:         tls.VersionTLS13,
+			},
+		}
+	}
+
 	// TODO: passing credentials through environment variable will be deprecated by "backup-restore v0.18.0"
 	if _, isSet := os.LookupEnv(prefixString + awsAcessKeyID); isSet {
 		return session.Options{
@@ -104,6 +133,7 @@ func getSessionOptions(prefixString string) (session.Options, error) {
 				Region:           pointer.StringPtr(os.Getenv(awsRegion)),
 				Endpoint:         pointer.StringPtr(os.Getenv(awsEndpoint)),
 				S3ForcePathStyle: s3path,
+				HTTPClient:       httpClient,
 			},
 		}, nil
 	}
@@ -141,12 +171,32 @@ func readAWSCredentialsJSONFile(filename string) (session.Options, error) {
 		return session.Options{}, err
 	}
 
+	httpClient := http.DefaultClient
+	if awsConfig.InsecureSkipVerify != nil && *awsConfig.InsecureSkipVerify == true {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: *awsConfig.InsecureSkipVerify},
+		}
+	}
+
+	if awsConfig.TrustedCaCert != nil {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM([]byte(*awsConfig.TrustedCaCert))
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:            caCertPool,
+				InsecureSkipVerify: false,
+				MinVersion:         tls.VersionTLS13,
+			},
+		}
+	}
+
 	return session.Options{
 		Config: aws.Config{
 			Credentials:      credentials.NewStaticCredentials(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, ""),
 			Region:           pointer.StringPtr(awsConfig.Region),
 			Endpoint:         awsConfig.Endpoint,
 			S3ForcePathStyle: awsConfig.S3ForcePathStyle,
+			HTTPClient:       httpClient,
 		},
 	}, nil
 }
@@ -170,12 +220,32 @@ func readAWSCredentialFiles(dirname string) (session.Options, error) {
 		return session.Options{}, err
 	}
 
+	httpClient := http.DefaultClient
+	if awsConfig.InsecureSkipVerify != nil && *awsConfig.InsecureSkipVerify == true {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: *awsConfig.InsecureSkipVerify},
+		}
+	}
+
+	if awsConfig.TrustedCaCert != nil {
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM([]byte(*awsConfig.TrustedCaCert))
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:            caCertPool,
+				InsecureSkipVerify: false,
+				MinVersion:         tls.VersionTLS13,
+			},
+		}
+	}
+
 	return session.Options{
 		Config: aws.Config{
 			Credentials:      credentials.NewStaticCredentials(awsConfig.AccessKeyID, awsConfig.SecretAccessKey, ""),
 			Region:           pointer.StringPtr(awsConfig.Region),
 			Endpoint:         awsConfig.Endpoint,
 			S3ForcePathStyle: awsConfig.S3ForcePathStyle,
+			HTTPClient:       httpClient,
 		},
 	}, nil
 }
@@ -224,6 +294,22 @@ func readAWSCredentialFromDir(dirname string) (*awsCredentials, error) {
 				return nil, err
 			}
 			awsConfig.S3ForcePathStyle = &val
+		case "insecureSkipVerify":
+			data, err := os.ReadFile(dirname + "/insecureSkipVerify")
+			if err != nil {
+				return nil, err
+			}
+			val, err := strconv.ParseBool(string(data))
+			if err != nil {
+				return nil, err
+			}
+			awsConfig.InsecureSkipVerify = &val
+		case "trustedCaCert":
+			data, err := os.ReadFile(dirname + "/trustedCaCert")
+			if err != nil {
+				return nil, err
+			}
+			awsConfig.TrustedCaCert = pointer.StringPtr(string(data))
 		}
 	}
 
